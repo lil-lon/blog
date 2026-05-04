@@ -312,7 +312,8 @@ def run_ase() -> WorkflowRun:
         default_dtype=str(DTYPE).removeprefix("torch."),
         enable_cueq=False,
     )
-    ase_friction = FRICTION_INV_FS * ase_units.fs
+    # ASE Langevin expects friction in inverse ASE-internal time units.
+    ase_friction = FRICTION_INV_FS / ase_units.fs
 
     def run_one(atoms: Atoms) -> None:
         a = atoms.copy()
