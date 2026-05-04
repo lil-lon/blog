@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# set up by executing `git config core.hooksPath .githooks`
+
+set -euo pipefail
+echo "=== Pre-commit checks ==="
+gitleaks git --pre-commit --redact --staged --verbose
+echo "=== All checks passed ==="
