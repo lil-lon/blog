@@ -1,0 +1,17 @@
+[project]
+name = "batched-md-blog"
+version = "0.1.0"
+description = "Blog about batched MD engine"
+readme = "README.md"
+requires-python = ">=3.13"
+
+dependencies = [
+    "nvalchemi-toolkit>=0.1.0",
+    "torch-sim-atomistic>=0.6.0",
+    "mace-torch>=0.3.13",
+    "matplotlib>=3.9",
+    "modal>=1.4.0",
+]
+
+[tool.uv]
+exclude-newer = "2026-04-25T00:00:00Z"
