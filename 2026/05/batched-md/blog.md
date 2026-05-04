@@ -2,12 +2,7 @@
 
 ## TL;DR
 
-Both libraries answer the same question — saturating a GPU with GNN-MLIPs by stacking *N* independent simulations into one forward pass — and they share most of the substrate: the same atom-axis batching abstraction (`batch_idx` / `system_idx`), the same `ModelConfig` / `ModelInterface` indirection over MACE / AIMNet2 / SevenNet, the same ensembles, the same FIRE relaxation primitives, and the same low-level kernel package (`nvalchemi-toolkit-ops`). The meaningful difference is *who owns the simulation loop*: in torch-sim it is a Python `for` you can rewrite verbatim; in ALCHEMI it is `BaseDynamics.run` and you customise via Hooks and Stage composition. That single decision propagates to where the neighbour list lives, how the autobatcher decides its budget, and how multi-stage / multi-GPU runs are expressed.
-
-The choice is design fit:
-
-- Pick **torch-sim** if you run on a single GPU, want to read and rewrite the loop, prefer empirical GPU calibration, and like a one-line driver API.
-- Pick **ALCHEMI Toolkit** if you need multi-GPU pipelines, hook-based instrumentation, persistent neighbor lists with a Verlet skin, or declared-cap autobatching that cannot OOM.
+Both libraries solve the same problem — batched GNN-MLIP simulation on a single GPU — and share most of the substrate. The meaningful difference is *who owns the simulation loop*: torch-sim hands you a Python `for` you can rewrite verbatim; ALCHEMI hands you `BaseDynamics.run` plus Hooks and Stage composition. Every observable difference downstream — neighbor list placement, autobatcher style, multi-stage and multi-GPU support — follows from that single design choice.
 
 ## Why both libraries look so similar
 
@@ -20,11 +15,10 @@ Two libraries that sit squarely in this niche, both released in the past year, a
 
 The shared substrate runs deep:
 
+- **GPU-resident batch.** Once a batch is on the device, both libraries keep it there for the entire run — no copy back to host between steps. This reflects a shared starting point: not "port a CPU-MD library to the GPU," but "write the loop GPU-native from the start."
 - **Atom-axis batching.** Both stack *N* systems on `dim=0` of an atom tensor. A per-atom `batch_idx` / `system_idx` identifies which system each atom belongs to; reductions (energy, kinetic energy, forces COM) are scatter operations gated by it. The pattern is `torch_geometric.data.Batch`.
-- **MLIP wrapper interface.** Both expose a small `ModelConfig` / `ModelInterface` that declares which outputs (`energy`, `forces`, `stress`) the model can produce, what is computed via autograd, and the cutoff used by the neighbour-list builder. Wrapping MACE, AIMNet2, SevenNet, or your own potential is a matter of implementing this interface.
-- **Conservative forces via autograd.** MACE wrappers in both libraries enable `requires_grad_` on positions in the input adapter and rely on MACE's internal autograd path; stress goes through the same displacement trick.
-- **Same ensembles.** NVE, NVT (Langevin and Nosé–Hoover), NPT (Langevin / Nosé–Hoover and stochastic-cell-rescale variants).
-- **Same relaxation primitives.** Both ship FIRE / FIRE2 with cell filters; torch-sim adds BFGS / LBFGS, ALCHEMI adds variable-cell FIRE2.
+- **ASE-compatible entry point.** Both libraries expose a `from_atoms` helper that builds a system (or batch) directly from `ase.Atoms`, so the input pipeline plugs into the existing materials-science ecosystem without conversion glue.
+- **MLIP wrapper interface.** Both expose a small `ModelConfig` / `ModelInterface` that declares which outputs (`energy`, `forces`, `stress`) the model can produce, what is computed via autograd, and the cutoff used by the neighbor-list builder. Wrapping MACE or your own potential is a matter of implementing this interface.
 - **Same low-level kernels.** Both depend on `nvalchemi-toolkit-ops` (NVIDIA Warp cell-list, thermostat utilities, dispersion / PME) for the fast paths.
 
 At the level of what the GPU does on each step, the two libraries are doing close to the same work. The differentiation lives in how the surrounding simulation loop is expressed.
@@ -33,11 +27,11 @@ At the level of what the GPU does on each step, the two libraries are doing clos
 
 | Axis | torch-sim | ALCHEMI Toolkit |
 | --- | --- | --- |
-| State container | Flat `SimState` dataclass; neighbour list lives inside model | Pydantic `AtomicData` → graph-structured `Batch` with explicit `neighbor_list` |
+| State container | Flat `SimState` dataclass; neighbor list lives inside model | Pydantic `AtomicData` → graph-structured `Batch` with explicit `neighbor_list` |
 | Driver API | One function `ts.integrate(...)` | Instantiate `NVTLangevin(...)`, register hooks, call `.run(batch)` |
 | Extensibility | Functional (`init_func`, `step_func` tuples) | Object-oriented + hooks (`BEFORE_STEP`, `BEFORE_COMPUTE`, `ON_CONVERGE`, …) |
-| Neighbour list | Recomputed every step inside `model.forward` (`torchsim_nl`) | Cached in batch, refreshed by `NeighborListHook` (Warp cell-list, optional Verlet skin) |
-| Batch sizing | `BinningAutoBatcher` (MD), `InFlightAutoBatcher` (optimize) | `SizeAwareSampler` for inflight batching, attached to any `BaseDynamics` |
+| Neighbor list | Recomputed every step inside `model.forward` (`torchsim_nl`) | Cached in batch, refreshed by `NeighborListHook` (Warp cell-list, optional Verlet skin) |
+| Batch sizing | `BinningAutoBatcher` (fixed-length), `InFlightAutoBatcher` | `SizeAwareSampler` for inflight batching, attached to any `BaseDynamics` |
 | Stage fusion | n/a | `dyn_a + dyn_b` → `FusedStage` shares one forward pass between two integrators |
 | Multi-GPU | Single-device by design | `DistributedPipeline` via the `\|` operator, with explicit rank topology |
 | Trajectory I/O | `TrajectoryReporter` → torch-sim binary | `ZarrData` sink with CSR-style variable-size graph layout |
@@ -59,7 +53,7 @@ class SimState:
     system_idx: torch.Tensor      # (n_atoms,), non-decreasing
 ```
 
-The neighbour list is *not* part of `SimState`; the model wrapper computes it on each forward pass. Running NVT Langevin on a list of ASE `Atoms` is one call:
+The neighbor list is *not* part of `SimState`; the model wrapper computes it on each forward pass. Running NVT Langevin on a list of ASE `Atoms` is one call:
 
 ```python
 import torch_sim as ts
@@ -77,7 +71,7 @@ final_state = ts.integrate(
 )
 ```
 
-`ts.integrate` is the entire public surface for MD. Internally it is the loop you would have written by hand: pick `(init_func, step_func)` from `INTEGRATOR_REGISTRY`, call `init_func(state, model, kT, dt)`, then `step_func(...)` `n_steps` times, optionally writing to a `TrajectoryReporter`. This is intentional — the design emphasises that an integrator is a pair of pure functions over a state, and a "batched" integrator is the same pair of functions written against a flat tensor with `system_idx`. To customise the loop, you read `runners.py` and rewrite it.
+`ts.integrate` is the entire public surface for MD. Internally it is the loop you would have written by hand: pick `(init_func, step_func)` from `INTEGRATOR_REGISTRY`, call `init_func(state, model, kT, dt)`, then `step_func(...)` `n_steps` times, optionally writing to a `TrajectoryReporter`. This is intentional — the design emphasizes that an integrator is a pair of pure functions over a state, and a "batched" integrator is the same pair of functions written against a flat tensor with `system_idx`. To customize the loop, you read `runners.py` and rewrite it.
 
 **ALCHEMI Toolkit — an explicit graph and an OO dynamics object.** The `nvalchemi.data` layer is closer to PyTorch Geometric than to a flat tensor blob. A single system is an `AtomicData` (Pydantic-validated, `jaxtyping`-annotated), and a batch is a `Batch` backed by a three-level tensor store:
 
@@ -109,19 +103,18 @@ dynamics.register_hook(
 dynamics.run(batch)
 ```
 
-The integrator is an object (`NVTLangevin`, `NVTNoseHoover`, `NPT`, …) inheriting from `BaseDynamics`. The step loop is `pre_update → compute → post_update`, with hooks fired at each boundary — neighbour-list rebuild, biased-potential injection, periodic wrapping, custom convergence checks all attach as `Hook` objects rather than reading from the integrator. To customise the loop, you register a hook or compose stages.
+The integrator is an object (`NVTLangevin`, `NVTNoseHoover`, `NPT`, …) inheriting from `BaseDynamics`. The step loop is `pre_update → compute → post_update`, with hooks fired at each boundary — neighbor-list rebuild, biased-potential injection, periodic wrapping, custom convergence checks all attach as `Hook` objects rather than reading from the integrator. To customize the loop, you register a hook or compose stages.
 
 The hook-based design is the thing that enables the rest of the toolkit:
 
-- **Verlet skin / cached neighbour lists.** `NeighborListHook` keeps a persistent staging buffer and rebuilds only when atoms have drifted more than the skin. The cell-list path uses an O(N) NVIDIA Warp kernel from the companion `nvalchemi-toolkit-ops` package.
 - **Inflight batching.** `SizeAwareSampler` plus `_CommunicationMixin.refill_check` graduate converged systems and pull in fresh ones mid-loop, sized by an atom/edge budget.
 - **Pipeline composition.** `dyn_a + dyn_b` produces a `FusedStage` that runs both integrators on a single GPU sharing one model forward pass; `dyn_a | dyn_b` produces a `DistributedPipeline` that splits stages across ranks.
 
 The split — Python `for` over pure functions vs. `BaseDynamics.run` with a hook lifecycle — propagates to everything below.
 
-### Neighbour list: inside the model or on the batch
+### Neighbor list: inside the model or on the batch
 
-The two libraries put the neighbour list in different places, and that is a direct consequence of where the loop lives.
+The two libraries put the neighbor list in different places, and that is a direct consequence of where the loop lives.
 
 **torch-sim — built into `model.forward`.** `MaceModel.forward` calls its `neighbor_list_fn` (default `torchsim_nl`, the in-package cell-list) on every invocation:
 
@@ -134,22 +127,7 @@ edge_index, mapping_system, unit_shifts = self.neighbor_list_fn(
 
 There is no cache: every step pays a full NL build. The user does nothing — the list is computed inside the model and never appears at the integrator level.
 
-**ALCHEMI — a hook on the batch.** The neighbour list is stored on the `Batch` (`batch.neighbor_list`, `batch.neighbor_list_shifts`). It is refreshed by `NeighborListHook` registered at `DynamicsStage.BEFORE_COMPUTE`. With `skin > 0` the hook calls `nvalchemiops`'s `batch_neighbor_list_needs_rebuild` to check, per system, whether any atom has drifted more than `skin / 2` since the previous build:
-
-```python
-# nvalchemi/hooks/neighbor_list.py
-if self.skin > 0.0 and self._ref_positions is not None:
-    _batch_nl_rebuild_inplace(
-        reference_positions=self._ref_positions,
-        current_positions=self._buf_positions,
-        batch_idx=self._buf_batch_idx,
-        rebuild_flags=self._rebuild_flags,
-        skin_distance_threshold=self.skin / 2,
-        ...
-    )
-```
-
-When the flag is clear the previous list is reused; staging buffers (`_buf_positions`, `_buf_cell`, …) are persistent, so even when a rebuild does happen there are no per-step allocations.
+**ALCHEMI — a hook on the batch.** The neighbor list is stored on the `Batch` (`batch.neighbor_list`, `batch.neighbor_list_shifts`). It is refreshed by `NeighborListHook` registered at `DynamicsStage.BEFORE_COMPUTE`. With `skin > 0` the hook checks per system whether any atom has drifted more than `skin / 2` since the previous build, and only triggers a rebuild for systems whose flag is set. Staging buffers (`_buf_positions`, `_buf_cell`, …) are persistent, so even when a rebuild does happen there are no per-step allocations.
 
 Concretely:
 
@@ -158,7 +136,7 @@ Concretely:
 | Where the NL lives | inside `model.forward`, transient | on the batch (`batch.neighbor_list`), persistent |
 | Cost per step | one full cell-list build | skin check; full build only on drift |
 | Setup the user pays | none (default) | `for hook in model.make_neighbor_hooks(): stage.register_hook(hook)` |
-| Customisation | swap `neighbor_list_fn` on the model | construct `NeighborListHook(skin=…, max_neighbors=…)`; or write a custom hook |
+| Customization | swap `neighbor_list_fn` on the model | construct `NeighborListHook(skin=…, max_neighbors=…)`; or write a custom hook |
 
 For low-temperature MD with small `dt` the Verlet skin can cut NL cost dramatically (rebuilds every tens of steps instead of every step). For FIRE-style relaxation, high-T MD, or NPT with active cell motion the skin invalidates often and the savings shrink.
 
@@ -166,7 +144,7 @@ The hook-vs-model split also explains the boilerplate ALCHEMI asks you to write:
 
 ### Autobatch sizing: probe-and-bin or declared-and-stream
 
-Both libraries face the same problem: the user submits a batch of independent systems but the GPU has fixed memory; the runtime has to decide how many systems to put through the model in one forward pass. Both ship an autobatcher to solve it. Their default behaviour is different in two independent ways: how the memory budget is *discovered*, and how the budget is *spent*.
+Both libraries face the same problem: the user submits a batch of independent systems but the GPU has fixed memory; the runtime has to decide how many systems to put through the model in one forward pass. Both ship an autobatcher to solve it. Their default behavior is different in two independent ways: how the memory budget is *discovered*, and how the budget is *spent*.
 
 **How the budget is discovered.**
 
@@ -197,11 +175,8 @@ ts.integrate(system=systems, model=model, integrator=..., autobatcher=batcher, .
 
 # ALCHEMI — explicit max_atoms bypasses the GPU heuristic.
 sampler = SizeAwareSampler(dataset=dataset, max_atoms=4096)
-fused = FusedStage(
-    sub_stages=[(0, NVTLangevin(model=model, dt=1.0, temperature=300.0, n_steps=...))],
-    sampler=sampler,
-)
-fused.run(batch=None, n_steps=...)
+nvt = NVTLangevin(model=model, dt=1.0, temperature=300.0, n_steps=..., sampler=sampler)
+nvt.run(batch=None, n_steps=...)
 ```
 
 At identical caps the two would issue the same number of forward passes for a uniform workload — torch-sim picks bin sizes upfront, ALCHEMI fills the live batch by streaming, but in both cases the steady-state batch size is `max_atoms_budget // n_atoms_per_system` and the number of waves is `ceil(N_requests / batch_size)`. The split is in *who pays the calibration cost*: torch-sim pays it once at startup with a probing pass; ALCHEMI pushes it onto the user as an explicit cap, with a heuristic fallback that errs conservative.
@@ -238,17 +213,17 @@ pipeline = relax | equil | prod
 pipeline.run(batch)   # launched via `torchrun --nproc-per-node=N`
 ```
 
-torch-sim is single-device, so multi-process coordination across GPUs would be on the user.
+torch-sim is single-device today, so multi-process coordination across GPUs would be on the user. The TorchSim paper (Cohen et al., arXiv:2508.06628) lists "improving parallelization strategies for multi-GPU and multi-node execution" in its Future Work section, but at the time of writing there is no in-tree distributed driver.
 
 For uniform workloads `+` and `|` are roughly equivalent in throughput to data parallelism — both spread the same total compute across GPUs. The case where these operators are more than syntactic convenience is *heterogeneous* workloads (different per-stage costs, different models per stage) where stages can be sized independently and converged systems stream forward without manual data movement.
 
 ## Closing — when to pick which
 
-The two libraries share the atom-axis batching abstraction (`batch_idx` / `system_idx`), the MLIP wrapper interface, the ensembles, and the low-level kernels. They diverge on who owns the simulation loop, and four observable consequences follow: where the neighbour list lives, how the autobatcher decides its budget, how multi-stage and multi-GPU runs are composed, and whether the loop itself is something you read or something you hook into.
+The two libraries share the atom-axis batching abstraction (`batch_idx` / `system_idx`), the MLIP wrapper interface, the ensembles, and the low-level kernels. They diverge on who owns the simulation loop, and four observable consequences follow: where the neighbor list lives, how the autobatcher decides its budget, how multi-stage and multi-GPU runs are composed, and whether the loop itself is something you read or something you hook into.
 
 Pick **torch-sim** if:
 
-- You run on a single GPU and the loop is the primary thing you'd want to customise — you would rather rewrite `runners.py` than register a hook.
+- You run on a single GPU and the loop is the primary thing you'd want to customize — you would rather rewrite `runners.py` than register a hook.
 - Empirical OOM-probing autobatch (no caps to tune, calibrates per GPU) fits how you deploy.
 - Functional `(init_func, step_func)` tuples and a one-line driver API match how you think about integrators.
 
@@ -256,13 +231,12 @@ Pick **ALCHEMI Toolkit** if:
 
 - You need multi-GPU pipelines (`|`) or fused single-GPU multi-stage runs (`+`) without writing the orchestration yourself.
 - You want hook-based instrumentation — biased potentials, custom convergence, periodic logging — without subclassing the integrator.
-- A neighbour list with a Verlet skin matters for your workload (low-T MD, small `dt`).
+- A neighbor list with a Verlet skin matters for your workload (low-T MD, small `dt`).
 - Declared-cap autobatching that cannot OOM is a hard requirement (e.g. shared-cluster jobs).
 
 Sources:
 
 - [torch-sim repository](https://github.com/TorchSim/torch-sim)
-- [TorchSim documentation](https://radical-ai.github.io/torch-sim/)
+- [Cohen et al., "TorchSim: An efficient atomistic simulation engine in PyTorch" (arXiv:2508.06628)](https://arxiv.org/abs/2508.06628)
 - [NVIDIA ALCHEMI Toolkit on GitHub](https://github.com/NVIDIA/nvalchemi-toolkit)
-- [ALCHEMI Toolkit documentation](https://nvidia.github.io/nvalchemi-toolkit/)
 - [ALCHEMI Toolkit-Ops on GitHub](https://github.com/NVIDIA/nvalchemi-toolkit-ops)
