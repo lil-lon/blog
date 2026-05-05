@@ -4,11 +4,13 @@
 
 Both libraries solve the same problem — batched GNN-MLIP simulation on a single GPU — and share most of the substrate. The meaningful difference is *who owns the simulation loop*: torch-sim hands you a Python `for` you can rewrite verbatim; ALCHEMI hands you `BaseDynamics.run` plus Hooks and Stage composition. Every observable difference downstream — neighbor list placement, autobatcher style, multi-stage and multi-GPU support — follows from that single design choice.
 
-## Why both libraries look so similar
+Disclaimer: I'm not a core developer of either library. This is a third-party reading of the public source as of 2026/05/05 — corrections welcome. The comparison is by design, not by raw throughput: performance numbers depend strongly on the chosen workload (NL update frequency, run length, system heterogeneity, GPU count), and a single representative figure would itself bias the comparison.
+
+## Why these batched MD libraries?
 
 Saturating a GPU during neural-network inference is generally hard. GNN-based machine-learned interatomic potentials (MLIPs) are no exception: a single forward pass on a 100-atom system touches only a small fraction of the FLOPs and memory bandwidth of a GPU, and running one system at a time leaves the device mostly idle. Molecular dynamics and geometry optimization are awkward in this regard: they are inherently sequential along the time / iteration axis, so a single trajectory's steps cannot be batched against each other. What *can* be batched is independent systems. **Client-side batched MD** stacks many independent simulations into a single forward pass and steps them in lockstep on the same device, recovering GPU efficiency without changing the underlying algorithm.
 
-Two libraries that sit squarely in this niche, both released in the past year, are:
+Two libraries that sit squarely in this niche, released within the last year — torch-sim in 2025, ALCHEMI Toolkit in 2026 — are:
 
 - [`torch-sim`](https://github.com/TorchSim/torch-sim) (`torch-sim-atomistic` on PyPI), from Radical AI.
 - [`nvalchemi-toolkit`](https://github.com/NVIDIA/nvalchemi-toolkit), the Python frontend of NVIDIA ALCHEMI.
@@ -33,7 +35,7 @@ At the level of what the GPU does on each step, the two libraries are doing clos
 | Neighbor list | Recomputed every step inside `model.forward` (`torchsim_nl`) | Cached in batch, refreshed by `NeighborListHook` (Warp cell-list, optional Verlet skin) |
 | Batch sizing | `BinningAutoBatcher` (fixed-length), `InFlightAutoBatcher` | `SizeAwareSampler` for inflight batching, attached to any `BaseDynamics` |
 | Stage fusion | n/a | `dyn_a + dyn_b` → `FusedStage` shares one forward pass between two integrators |
-| Multi-GPU | Single-device by design | `DistributedPipeline` via the `\|` operator, with explicit rank topology |
+| Multi-GPU | Single-device today (multi-GPU listed as future work) | `DistributedPipeline` via the `\|` operator, with explicit rank topology |
 | Trajectory I/O | `TrajectoryReporter` → torch-sim binary | `ZarrData` sink with CSR-style variable-size graph layout |
 
 The deepest difference is *where the simulation loop lives*. Every row above is downstream of it.
@@ -142,45 +144,6 @@ For low-temperature MD with small `dt` the Verlet skin can cut NL cost dramatica
 
 The hook-vs-model split also explains the boilerplate ALCHEMI asks you to write: a `NeighborListHook` is just one Hook among many (`WrapPeriodicHook`, `LoggingHook`, biased-potential hooks, custom NL implementations). Forcing explicit registration keeps that abstraction uniform — if NL were special-cased into the dynamics class, swapping in a custom NL builder or attaching multiple NLs (e.g. short-range MLIP + long-range Coulomb) would not compose. torch-sim makes the opposite call: NL inside the model wrapper, lower flexibility, less ceremony.
 
-### Autobatch sizing: probe-and-bin or declared-and-stream
-
-Both libraries face the same problem: the user submits a batch of independent systems but the GPU has fixed memory; the runtime has to decide how many systems to put through the model in one forward pass. Both ship an autobatcher to solve it. Their default behavior is different in two independent ways: how the memory budget is *discovered*, and how the budget is *spent*.
-
-**How the budget is discovered.**
-
-- *torch-sim's default — empirical OOM probing.* When you call `ts.integrate(autobatcher=True)`, the constructed `BinningAutoBatcher` has `max_memory_scaler=None`. On the first `load_states(...)` call, `estimate_max_memory_scaler` replicates the smallest and largest input states geometrically (`scale_factor=1.6`) and runs forward passes until it catches a `CUDA out of memory` exception, then backs off two steps and uses that as the budget. One slow setup pass, calibrated to the actual GPU.
-- *ALCHEMI's default — declared caps with a conservative GPU heuristic.* `SizeAwareSampler` requires the user to pass at least one of `max_atoms` / `max_batch_size` upfront. If `max_atoms` is omitted, an internal heuristic (`_estimate_max_atoms_from_gpu`) reads `torch.cuda.get_device_properties().total_memory`, multiplies by `max_gpu_memory_fraction=0.8`, subtracts a 20% model-overhead reserve, and divides by a fixed `300 bytes/atom`. The two combine via `min(user_cap, gpu_estimate)` — the more restrictive wins. No OOM is ever risked.
-
-**What the budget is denominated in.**
-
-| | torch-sim | ALCHEMI |
-| --- | --- | --- |
-| Budget | one scalar (`max_memory_scaler`) | three independent caps (`max_atoms`, `max_edges`, `max_batch_size`) |
-| Metric for the scalar | choice of `n_atoms`, `n_atoms_x_density`, or `n_edges` | atoms and edges are separate caps; density is implicit in `max_atoms` |
-
-The unit of `max_memory_scaler` depends on `memory_scales_with`. With `"n_atoms"` it is integer atoms; with `"n_atoms_x_density"` (the default) it is `atoms² / nm³`; with `"n_edges"` it is integer edges. The bin-pack constraint is just `sum(metric per system) ≤ max_memory_scaler`.
-
-**How the budget is spent.**
-
-- *torch-sim, phase-based.* `BinningAutoBatcher.load_states` runs a first-fit-decreasing bin-pack (`to_constant_volume_bins`) over the full input list, decides every bin upfront, and then iterates: each bin runs to completion (full `n_steps`) before the next bin starts. For optimization workloads where systems converge at different rates there is a separate `InFlightAutoBatcher` that hot-swaps converged systems out and pulls fresh ones in.
-- *ALCHEMI, streaming.* `SizeAwareSampler` pre-scans the dataset's metadata (`get_metadata(idx) → (n_atoms, n_edges)`) without loading systems. `build_initial_batch` round-robins across atom-count bins to fill the live batch under the caps. As individual systems graduate (via the integrator's per-system `n_steps` budget or a `ConvergenceHook`), `request_replacement(num_atoms, num_edges)` finds an unconsumed dataset sample that fits the freed slot. The live batch stays on the GPU; only its membership rotates.
-
-Both autobatchers can be driven declaratively, and that mode is the right one for repeatable production runs:
-
-```python
-# torch-sim — explicit max_memory_scaler skips the OOM probing entirely.
-batcher = BinningAutoBatcher(model=model, memory_scales_with="n_atoms",
-                             max_memory_scaler=4096)
-ts.integrate(system=systems, model=model, integrator=..., autobatcher=batcher, ...)
-
-# ALCHEMI — explicit max_atoms bypasses the GPU heuristic.
-sampler = SizeAwareSampler(dataset=dataset, max_atoms=4096)
-nvt = NVTLangevin(model=model, dt=1.0, temperature=300.0, n_steps=..., sampler=sampler)
-nvt.run(batch=None, n_steps=...)
-```
-
-At identical caps the two would issue the same number of forward passes for a uniform workload — torch-sim picks bin sizes upfront, ALCHEMI fills the live batch by streaming, but in both cases the steady-state batch size is `max_atoms_budget // n_atoms_per_system` and the number of waves is `ceil(N_requests / batch_size)`. The split is in *who pays the calibration cost*: torch-sim pays it once at startup with a probing pass; ALCHEMI pushes it onto the user as an explicit cap, with a heuristic fallback that errs conservative.
-
 ### Multi-stage and multi-GPU composition
 
 A typical `relax → equilibrate → production` workflow can be expressed two ways:
@@ -216,6 +179,52 @@ pipeline.run(batch)   # launched via `torchrun --nproc-per-node=N`
 torch-sim is single-device today, so multi-process coordination across GPUs would be on the user. The TorchSim paper (Cohen et al., arXiv:2508.06628) lists "improving parallelization strategies for multi-GPU and multi-node execution" in its Future Work section, but at the time of writing there is no in-tree distributed driver.
 
 For uniform workloads `+` and `|` are roughly equivalent in throughput to data parallelism — both spread the same total compute across GPUs. The case where these operators are more than syntactic convenience is *heterogeneous* workloads (different per-stage costs, different models per stage) where stages can be sized independently and converged systems stream forward without manual data movement.
+
+### Autobatch sizing: probe-and-bin or declared-and-stream
+
+Both libraries face the same problem: the user submits a batch of independent systems but the GPU has fixed memory; the runtime has to decide how many systems to put through the model in one forward pass. Both ship an autobatcher to solve it. Their default behavior is different in two independent ways: how the memory budget is *discovered*, and how the budget is *spent*.
+
+**How the budget is discovered.**
+
+- *torch-sim's default — empirical OOM probing.* When you call `ts.integrate(autobatcher=True)`, the constructed `BinningAutoBatcher` has `max_memory_scaler=None`. On the first `load_states(...)` call, `estimate_max_memory_scaler` replicates the smallest and largest input states geometrically (`scale_factor=1.6`) and runs forward passes until it catches a `CUDA out of memory` exception, then backs off two steps and uses that as the budget. One slow setup pass, calibrated to the actual GPU.
+- *ALCHEMI's default — declared caps with a conservative GPU heuristic.* `SizeAwareSampler` requires the user to pass at least one of `max_atoms` / `max_batch_size` upfront. If `max_atoms` is omitted, an internal heuristic (`_estimate_max_atoms_from_gpu`) reads `torch.cuda.get_device_properties().total_memory`, multiplies by `max_gpu_memory_fraction=0.8`, subtracts a 20% model-overhead reserve, and divides by a fixed `300 bytes/atom`. The two combine via `min(user_cap, gpu_estimate)` — the more restrictive wins. No OOM is ever risked.
+
+**What the budget is denominated in.**
+
+| | torch-sim | ALCHEMI |
+| --- | --- | --- |
+| Budget | one scalar (`max_memory_scaler`) | three independent caps (`max_atoms`, `max_edges`, `max_batch_size`) |
+| Metric for the scalar | choice of `n_atoms`, `n_atoms_x_density`, or `n_edges` | atoms and edges are separate caps; density is implicit in `max_atoms` |
+
+The unit of `max_memory_scaler` depends on `memory_scales_with`. With `"n_atoms"` it is integer atoms; with `"n_atoms_x_density"` (the default) it is `atoms² / nm³`; with `"n_edges"` it is integer edges. The bin-pack constraint is just `sum(metric per system) ≤ max_memory_scaler`.
+
+**How the budget is spent.**
+
+- *torch-sim, phase-based.* `BinningAutoBatcher.load_states` runs a first-fit-decreasing bin-pack (`to_constant_volume_bins`) over the full input list, decides every bin upfront, and then iterates: each bin runs to completion (full `n_steps`) before the next bin starts. For optimization workloads where systems converge at different rates there is a separate `InFlightAutoBatcher` that hot-swaps converged systems out and pulls fresh ones in.
+- *ALCHEMI, streaming.* `SizeAwareSampler` pre-scans the dataset's metadata (`get_metadata(idx) → (n_atoms, n_edges)`) without loading systems. `build_initial_batch` round-robins across atom-count bins to fill the live batch under the caps. As individual systems graduate (via the integrator's per-system `n_steps` budget or a `ConvergenceHook`), `request_replacement(num_atoms, num_edges)` finds an unconsumed dataset sample that fits the freed slot. The live batch stays on the GPU; only its membership rotates.
+
+Both autobatchers can be driven declaratively, and that mode is the right one for repeatable production runs:
+
+```python
+# torch-sim — explicit max_memory_scaler skips the OOM probing entirely.
+batcher = BinningAutoBatcher(model=model, memory_scales_with="n_atoms",
+                             max_memory_scaler=4096)
+ts.integrate(system=systems, model=model, integrator=..., autobatcher=batcher, ...)
+
+# ALCHEMI — explicit max_atoms bypasses the GPU heuristic. The sampler attaches
+# to the entry stage of a FusedStage (see previous section); FusedStage.run()
+# builds the initial batch from the sampler and pulls replacements mid-loop.
+sampler = SizeAwareSampler(dataset=dataset, max_atoms=4096)
+relax = FIRE2(model=model, dt=0.01, n_steps=200,
+              sampler=sampler, refill_frequency=1,
+              convergence_hook=ConvergenceHook.from_fmax(0.05))
+prod  = NVTLangevin(model=model, dt=1.0, temperature=300.0, n_steps=1000)
+fused = relax + prod
+with fused:
+    fused.run()
+```
+
+At identical caps the two would issue the same number of forward passes for a uniform workload — torch-sim picks bin sizes upfront, ALCHEMI fills the live batch by streaming, but in both cases the steady-state batch size is `max_atoms_budget // n_atoms_per_system` and the number of waves is `ceil(N_requests / batch_size)`. The split is in *who pays the calibration cost*: torch-sim pays it once at startup with a probing pass; ALCHEMI pushes it onto the user as an explicit cap, with a heuristic fallback that errs conservative.
 
 ## Closing — when to pick which
 
