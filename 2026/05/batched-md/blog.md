@@ -32,7 +32,7 @@ At the level of what the GPU does on each step, the two libraries are doing clos
 | State container | Flat `SimState` dataclass; neighbor list lives inside model | Pydantic `AtomicData` → graph-structured `Batch` with explicit `neighbor_list` |
 | Driver API | One function `ts.integrate(...)` | Instantiate `NVTLangevin(...)`, register hooks, call `.run(batch)` |
 | Extensibility | Functional (`init_func`, `step_func` tuples) | Object-oriented + hooks (`BEFORE_STEP`, `BEFORE_COMPUTE`, `ON_CONVERGE`, …) |
-| Neighbor list | Recomputed every step inside `model.forward` (`torchsim_nl`) | Cached in batch, refreshed by `NeighborListHook` (Warp cell-list, optional Verlet skin) |
+| Neighbor list | Built every step inside `model.forward` via a swappable `neighbor_list_fn`; default `torchsim_nl` dispatches across Warp / vesin / pure-PyTorch backends | Cached on the batch, refreshed by `NeighborListHook` at `BEFORE_COMPUTE` with optional per-system Verlet skin |
 | Batch sizing | `BinningAutoBatcher` (fixed-length), `InFlightAutoBatcher` | `SizeAwareSampler` for inflight batching, attached to any `BaseDynamics` |
 | Stage fusion | n/a | `dyn_a + dyn_b` → `FusedStage` shares one forward pass between two integrators |
 | Multi-GPU | Single-device today (multi-GPU listed as future work) | `DistributedPipeline` via the `\|` operator, with explicit rank topology |
@@ -116,9 +116,9 @@ The split — Python `for` over pure functions vs. `BaseDynamics.run` with a hoo
 
 ### Neighbor list: inside the model or on the batch
 
-The two libraries put the neighbor list in different places, and that is a direct consequence of where the loop lives.
+The two libraries put the neighbor list in different layers. That placement — not the choice of underlying kernel — is the meaningful asymmetry: both ship multiple NL backends, and both expose backend choice to the user.
 
-**torch-sim — built into `model.forward`.** `MaceModel.forward` calls its `neighbor_list_fn` (default `torchsim_nl`, the in-package cell-list) on every invocation:
+**torch-sim — built inside `model.forward`, swappable via a constructor arg.** `MaceModel.__init__` accepts `neighbor_list_fn: Callable = torchsim_nl`, and the model calls it on every forward pass:
 
 ```python
 # torch_sim/models/mace.py
@@ -127,22 +127,33 @@ edge_index, mapping_system, unit_shifts = self.neighbor_list_fn(
 )
 ```
 
-There is no cache: every step pays a full NL build. The user does nothing — the list is computed inside the model and never appears at the integrator level.
+`torchsim_nl` is itself a dispatcher (`torch_sim/neighbors/__init__.py`) that picks at import time among the backends shipped in-tree: `alchemiops_nl_n2` / `alchemiops_nl_cell_list` (NVIDIA Warp, the default when available), `vesin_nl_ts` / `vesin_nl` (vesin, an optional install), and `torch_nl_linked_cell` / `torch_nl_n2` (pure PyTorch). To swap, pass a different `neighbor_list_fn` at construction. None of these backends accept a `skin` parameter and the model wrapper holds no NL state across steps, so every step pays a full build.
 
-**ALCHEMI — a hook on the batch.** The neighbor list is stored on the `Batch` (`batch.neighbor_list`, `batch.neighbor_list_shifts`). It is refreshed by `NeighborListHook` registered at `DynamicsStage.BEFORE_COMPUTE`. With `skin > 0` the hook checks per system whether any atom has drifted more than `skin / 2` since the previous build, and only triggers a rebuild for systems whose flag is set. Staging buffers (`_buf_positions`, `_buf_cell`, …) are persistent, so even when a rebuild does happen there are no per-step allocations.
+**ALCHEMI — a hook on the batch, with an optional Verlet skin.** The neighbor list lives on `Batch` (`batch.neighbor_list`, `batch.neighbor_list_shifts`). It is refreshed by `NeighborListHook` at `DynamicsStage.BEFORE_COMPUTE`. The hook is **not auto-registered** — `BaseDynamics` does not inspect `model.model_config.neighbor_config`, so the user wires it once at setup, reading the config off the model:
+
+```python
+dynamics.register_hook(
+    NeighborListHook(model.model_config.neighbor_config,
+                     stage=DynamicsStage.BEFORE_COMPUTE,
+                     skin=0.5),  # default 0.0 → rebuild every step
+)
+```
+
+Internally the hook dispatches between two backends — `batch_naive` for avg < 2000 atoms/system, `batch_cell_list` above — both from `nvalchemiops.torch.neighbors`. With `skin > 0` it tracks per-atom drift in pre-allocated staging buffers (`_buf_positions`, `_buf_cell`, …) and rebuilds only those systems whose flag is set, with no per-step allocations.
 
 Concretely:
 
 | | torch-sim | ALCHEMI |
 | --- | --- | --- |
 | Where the NL lives | inside `model.forward`, transient | on the batch (`batch.neighbor_list`), persistent |
-| Cost per step | one full cell-list build | skin check; full build only on drift |
-| Setup the user pays | none (default) | `for hook in model.make_neighbor_hooks(): stage.register_hook(hook)` |
-| Customization | swap `neighbor_list_fn` on the model | construct `NeighborListHook(skin=…, max_neighbors=…)`; or write a custom hook |
+| Default backend | `torchsim_nl` dispatcher (Warp → vesin → pure PyTorch) | `nvalchemiops.neighbor_list` (naive / cell-list) |
+| Caching | none — full build every step | optional Verlet skin, per-system rebuild flags |
+| Customization | `neighbor_list_fn=` at `MaceModel.__init__` | `NeighborListHook(skin=…, max_neighbors=…)`, or a custom hook |
+| User wires it up | no — default dispatcher used automatically | yes — one `register_hook(NeighborListHook(...))` |
 
 For low-temperature MD with small `dt` the Verlet skin can cut NL cost dramatically (rebuilds every tens of steps instead of every step). For FIRE-style relaxation, high-T MD, or NPT with active cell motion the skin invalidates often and the savings shrink.
 
-The hook-vs-model split also explains the boilerplate ALCHEMI asks you to write: a `NeighborListHook` is just one Hook among many (`WrapPeriodicHook`, `LoggingHook`, biased-potential hooks, custom NL implementations). Forcing explicit registration keeps that abstraction uniform — if NL were special-cased into the dynamics class, swapping in a custom NL builder or attaching multiple NLs (e.g. short-range MLIP + long-range Coulomb) would not compose. torch-sim makes the opposite call: NL inside the model wrapper, lower flexibility, less ceremony.
+The hook-vs-model split also explains the one extra line ALCHEMI asks you to write: a `NeighborListHook` is just one Hook among many (`WrapPeriodicHook`, `LoggingHook`, biased-potential hooks, custom NL implementations). Forcing explicit registration keeps that abstraction uniform — if NL were special-cased into the dynamics class, swapping in a custom NL builder or attaching multiple NLs (e.g. short-range MLIP + long-range Coulomb) would not compose. torch-sim makes the opposite call: NL inside the model wrapper, no skin layer, but with the same multi-backend choice exposed via a single constructor arg.
 
 ### Multi-stage and multi-GPU composition
 
