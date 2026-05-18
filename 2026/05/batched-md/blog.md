@@ -12,7 +12,7 @@ Saturating a GPU during neural-network inference is generally hard. GNN-based ma
 
 Two libraries that sit squarely in this niche, released within the last year — torch-sim in 2025, ALCHEMI Toolkit in 2026 — are:
 
-- [`torch-sim`](https://github.com/TorchSim/torch-sim) (`torch-sim-atomistic` on PyPI), from Radical AI.
+- [`torch-sim`](https://github.com/TorchSim/torch-sim) (`torch-sim-atomistic` on PyPI), spun out of Radical AI and now [community-governed](https://github.com/TorchSim/torch-sim/blob/main/GOVERNANCE.md).
 - [`nvalchemi-toolkit`](https://github.com/NVIDIA/nvalchemi-toolkit), the Python frontend of NVIDIA ALCHEMI.
 
 The shared substrate runs deep:
