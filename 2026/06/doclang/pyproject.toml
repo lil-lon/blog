@@ -1,0 +1,10 @@
+[project]
+name = "doclang-blog"
+version = "0.1.0"
+description = "Blog about doclang"
+requires-python = ">=3.13"
+
+dependencies = [
+    "doclang>=0.5.0",
+    "docling>=2.97.0",
+]
