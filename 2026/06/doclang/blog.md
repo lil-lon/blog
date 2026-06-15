@@ -1,27 +1,34 @@
 # Introduction of Docling and DocLang
 
-## Have you ever fought with Claude Code over a PDF?
+## Have you ever fought with Claude Code over a document?
 
-Have you ever handed a PDF to an AI assistant and gotten back answers that were subtly off? The content is perfectly readable to you, yet the model keeps getting it wrong.
+Have you ever handed a document to an AI assistant and gotten back answers that were subtly off? A PDF spec, a Word report, a research paper, a scanned form. The content is perfectly readable to you, yet the model keeps getting it wrong.
 
 This is not a model intelligence problem. It is a format problem.
 
-<!-- TODO: confirm how Claude Code handles PDFs internally. The linked page documents the Claude API, not Claude Code. https://platform.claude.com/docs/en/build-with-claude/pdf-support -->
-Modern assistants do have machinery for ingesting PDFs. They typically combine extracted text with rendered page images so a vision-capable model can "look" at the page. This works, but it inherits every weakness of the PDF format itself.
+## How Claude already deals with PDFs
 
-## PDF was never meant for machines
+Claude is not helpless with PDFs. The Claude API documents first-class [PDF support](https://platform.claude.com/docs/en/build-with-claude/pdf-support), handling both the extracted text and the visual layout of each page. Claude Code does not document a PDF mechanism of its own, but Anthropic ships an official [PDF skill](https://github.com/anthropics/skills/tree/main/skills/pdf) that an agent can load on demand.
 
-A PDF describes where to place glyphs on a page so that ink lands in the right spot when printed. That is the entire job it was designed for. It does not record that a run of characters is a heading, that twelve numbers form a 3x4 table, or that "Name:" is followed by a fillable field. The PDF backend used by the tools below says so in its own documentation: the library "does not implement layout analysis, such as detecting words, lines, or paragraphs."
+That skill is a toolbox of conventional Python libraries. It uses `pdfplumber` for layout-aware text and table extraction, `pypdf` for structural operations such as merge, split, rotate, and encrypt, and `pytesseract` with `pdf2image` for OCR on scanned pages. To fill an interactive form it renders the page to an image and checks field bounding boxes so values land in the right place.
 
-So when an AI reads a PDF, it has to reverse-engineer structure that the format threw away:
+For one-off jobs (fill this form, merge these reports, pull the text out of a memo) this is plenty.
 
-- **Tables** collapse into a flat stream of numbers with no row or column boundaries.
-- **Multi-column layouts** interleave the left and right columns line by line.
-- **Formulas** turn into garbled symbol soup.
-- **Scanned pages** carry no text layer at all.
-- **Provenance** (which page and where on it) is lost the moment you extract the text.
+## Why the skill is not the whole answer
 
-Markdown, the format most AI pipelines fall back to, fixes some of this. It has headings, lists, and simple tables, and it tokenizes cleanly. But it is lossy in the other direction. It cannot record geometry, it cannot express merged or nested table cells, it has no notion of a form field, a background layer, or a cross-reference. Markdown is a good destination for prose and a poor one for real-world documents.
+The skill works because most PDFs cooperate. It stops working where the format does. A PDF only records where to place glyphs on a page so the ink lands correctly when printed. It does not record that a line is a heading, that a block of numbers is a 3x4 table, or that "Name:" labels a fillable field. The PDF backend behind these tools says so in its own documentation: it "does not implement layout analysis, such as detecting words, lines, or paragraphs."
+
+So the skill has to reverse-engineer structure the format threw away, and the seams show:
+
+- **Tables.** `pdfplumber` recovers a grid from ruling lines or text alignment. Give it a borderless table, merged cells, or nested cells, and the rows and columns come out wrong.
+- **Reading order.** A two-column page is just glyphs at coordinates. Naive extraction interleaves the columns line by line.
+- **Scanned pages.** With no text layer, you fall back to `pytesseract`, the slow and error-prone OCR that document AI has spent years trying to escape.
+- **Formulas and code** degrade into symbol soup, with no LaTeX and no language tag.
+- **Provenance and semantics stay separate.** You can get text, and separately some bounding boxes, but nothing hands you one object that says "this is a heading, on page 3, at this box, in the body layer."
+
+The deeper problem is that the output is ad hoc. Each task produces a string or a DataFrame for that task, with no shared, checkable representation behind it. There is nothing to validate and nothing another system can rely on as an interchange format. That is fine for a quick fix and wrong for a pipeline.
+
+Markdown, the format most AI pipelines fall back to, only goes halfway. It has headings, lists, and simple tables, and it tokenizes cleanly. But it is lossy in the other direction. It cannot record geometry, it cannot express merged or nested table cells, and it has no notion of a form field, a background layer, or a cross-reference. Markdown is a good destination for prose and a poor one for real-world documents.
 
 ## Two open-source projects built for this gap
 
@@ -32,13 +39,13 @@ The document-AI gap is now being closed in the open. Two projects, both governed
 
 In short: **Docling is the tool, DocLang is the standard.** The rest of this post explains each one and why the pairing matters.
 
-## Docling: parse once, export many ways
+## Docling: many formats in, one model out
 
-Docling's core idea is to parse a document a single time into a rich in-memory model called `DoclingDocument`, then serialize that model into whatever a downstream consumer needs.
+Real document piles are a mix of Word files, slide decks, spreadsheets, web pages, LaTeX sources, scans, and more, each with its own quirks. Docling's real strength is the funnel: it ingests PDF, DOCX, PPTX, XLSX, HTML, Markdown, AsciiDoc, LaTeX, images, and audio, and turns every one of them into a single in-memory model called `DoclingDocument`. The messy variety goes in, one uniform representation comes out.
 
-The parsing does not rely on brittle OCR-first heuristics. Docling uses purpose-built models: a layout model that detects page elements (text blocks, headings, tables, figures, captions) and a dedicated table-structure model (TableFormer) that recovers the row and column grid of a table from its image. The result is a single object that knows the document's reading order, element types, and the page and bounding box of every piece of content.
+How much work that takes depends on the input. Born-digital formats like DOCX or LaTeX already carry their structure, so it is mostly a matter of reading it out. PDFs and scans are where Docling earns its keep: it does not rely on brittle OCR-first heuristics but on purpose-built models, a layout model that detects page elements (headings, tables, figures, captions) and a table-structure model (TableFormer) that recovers a table's grid from its image. Either way you end up with the same object, one that knows the document's reading order, element types, and the page and bounding box of every piece of content.
 
-From that one object you can export to several formats:
+From that one model you export to whatever a downstream consumer needs:
 
 ```python
 from docling.document_converter import DocumentConverter
