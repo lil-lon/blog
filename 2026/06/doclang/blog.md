@@ -43,21 +43,71 @@ In short: **Docling is the tool, DocLang is the standard.** The rest of this pos
 
 Real document piles are a mix of Word files, slide decks, spreadsheets, web pages, LaTeX sources, scans, and more, each with its own quirks. Docling's real strength is the funnel: it ingests PDF, DOCX, PPTX, XLSX, HTML, Markdown, AsciiDoc, LaTeX, images, and audio, and turns every one of them into a single in-memory model called `DoclingDocument`. The messy variety goes in, one uniform representation comes out.
 
-How much work that takes depends on the input. Born-digital formats like DOCX or LaTeX already carry their structure, so it is mostly a matter of reading it out. PDFs and scans are where Docling earns its keep: it does not rely on brittle OCR-first heuristics but on purpose-built models, a layout model that detects page elements (headings, tables, figures, captions) and a table-structure model (TableFormer) that recovers a table's grid from its image. Either way you end up with the same object, one that knows the document's reading order, element types, and the page and bounding box of every piece of content.
+How much work that takes depends on the input. Born-digital formats like DOCX or LaTeX already carry their structure, so it is mostly a matter of reading it out. PDFs and scans are where Docling earns its keep, leaning on trained models rather than brittle heuristics. The rest of this section traces exactly how, from the single API call to the final object.
 
-From that one model you export to whatever a downstream consumer needs:
+## Inside Docling: from convert() to a DoclingDocument
+
+### The entry point
+
+`DocumentConverter().convert(source)` is the whole public API. It returns a `ConversionResult`, and `.document` is the `DoclingDocument`:
 
 ```python
 from docling.document_converter import DocumentConverter
 
-doc = DocumentConverter().convert("paper.pdf").document
+result = DocumentConverter().convert("paper.pdf")
+doc = result.document
+```
+
+Behind that one call, Docling detects the input format (by magic bytes first, then file extension, then by sniffing the content) and routes it to a matching pair of backend and pipeline. A PDF goes to `DoclingParseDocumentBackend` plus the `StandardPdfPipeline`. Born-digital formats like Word or LaTeX take a lighter `SimplePipeline` and never touch a vision model, because their structure is already in the file.
+
+### The PDF pipeline, stage by stage
+
+For a PDF the work happens in `StandardPdfPipeline`. It starts at the backend, which hands over both the text and the pixels of each page:
+
+```python
+class PdfPageBackend(ABC):
+    def get_text_cells(self) -> Iterable[TextCell]: ...                   # native text with coordinates
+    def get_page_image(self, scale=1, cropbox=None) -> Image.Image: ...   # the page as pixels
+```
+
+From there each page flows through a chain of stages, each backed by its own model:
+
+1. **Preprocess.** Render the page to an image and read the backend's native text cells.
+2. **OCR.** For scanned pages or image regions with no extractable text, an OCR model (RapidOCR by default) reads the characters back from the pixels. Born-digital text skips this.
+3. **Layout.** A vision model detects the regions on the page image and labels each one (heading, text, table, figure, caption, ...) with a bounding box.
+4. **Table structure.** Every region labelled a table is cropped and passed to **TableFormer**, which predicts the row and column grid as an OTSL token sequence, the same OTSL that DocLang uses.
+5. **Assemble.** The page's elements are collected. Optional enrichment can run here too, including a small VLM that turns code and formula images into text and LaTeX, and a picture-description model.
+
+A reading-order model then stitches every page's elements into one ordered `DoclingDocument`. The layout detector, TableFormer, the OCR engine, and the optional VLMs are exactly the model weights Docling pulls from HuggingFace on the first run. Docling also offers a fully VLM-based pipeline (SmolDocling or Granite-Docling) that emits the structure directly, but the default is this ensemble of specialised models.
+
+### The output shape
+
+The result is a `DoclingDocument`, a normalized graph rather than a blob of text:
+
+```python
+class DoclingDocument(BaseModel):
+    body: GroupItem            # the reading-order tree, root self_ref "#/body"
+    texts: list[...]           # SectionHeaderItem, ListItem, CodeItem, FormulaItem, TextItem, ...
+    pictures: list[PictureItem]
+    tables: list[TableItem]
+    key_value_items: list[KeyValueItem]
+    pages: dict[int, PageItem]
+```
+
+Content lives in the flat, typed lists (`texts`, `tables`, `pictures`, ...), while `body` is a tree of references that records the reading order. Each item has a `self_ref` that is a JSON pointer such as `#/texts/4`, so the document is a graph where every element exists once and is pointed at from the tree. Each item also carries the metadata the raw PDF threw away: a **label** for its type, a **`prov`** entry with its page and bounding box, and a **`content_layer`** (body, furniture for headers and footers, background for watermarks).
+
+Producing an output is then just a walk over that tree:
+
+```python
+for item, level in doc.iterate_items():   # body, in reading order
+    ...
 
 doc.export_to_markdown()   # human-friendly, great for prose
 doc.export_to_doctags()    # compact tag stream used to train vision-language models
 doc.export_to_doclang()    # the AI-native standard format
 ```
 
-That last line is the bridge to the second half of the story.
+All three exporters make the same traversal and dispatch on each item's type. A heading becomes a `#` in Markdown and a `<heading>` in DocLang. A table becomes a pipe table in Markdown and an OTSL run in DocLang. Same model, different serializer, which is why parsing once is enough and where DocLang plugs in.
 
 ## DocLang: a format designed for how LLMs actually read
 
