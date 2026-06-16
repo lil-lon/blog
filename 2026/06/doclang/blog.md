@@ -127,13 +127,72 @@ A few features show why it is more AI-friendly than PDF or Markdown.
 
 Put together, the pipeline is: **Docling parses the messy real-world document, and DocLang is the clean, checkable, AI-native form it hands to the model.**
 
-## A concrete example: converting a paper from PDF to DocLang
+## A case study: reading the equations in a real paper
 
-<!-- TODO: convert a real paper PDF with Docling and export to both Markdown and DocLang.
-     Show a table and the reading order that naive PDF text extraction breaks but Docling
-     keeps, point out the OTSL table tokens and location data preserved in the DocLang output,
-     then validate that output with the DocLang reference validator. -->
-*TODO: concrete code example (PDF to DocLang via Docling).*
+When you ask an AI about a scientific paper, the equations are often the part you care about most, and they are exactly what survives the worst in plain text extraction. To make the comparison concrete, we put the Anthropic PDF skill from earlier against Docling on a 34-page review of machine-learned interatomic potentials.
+
+The skill has no formula-specific step. It reaches for general-purpose text extraction, and its reference uses `pdfplumber`. This is not unique to that one skill. Most PDF skills lean on the same two building blocks, `pypdf` (`PdfReader`) and `pdfplumber`, as you can see in both [Anthropic's PDF skill](https://github.com/anthropics/skills/blob/main/skills/pdf/SKILL.md) and [community ones](https://github.com/ComposioHQ/awesome-claude-skills/blob/master/document-skills/pdf/SKILL.md), so the limitation is shared. Its other tools do not help here either: the table extractor is built for ruled tables, and the OCR path is a fallback for scans, so neither touches a born-digital equation. For Docling, formula recognition is one extra flag (off by default, because it loads a small vision-language model):
+
+```python
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions
+
+opts = PdfPipelineOptions()
+opts.do_formula_enrichment = True
+
+doc = DocumentConverter(
+    format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
+).convert("paper.pdf").document
+doc.save_as_doclang("paper.dclg.xml")
+```
+
+Here is what the skill's `pdfplumber` extraction makes of equation (4), a rotation of spherical harmonics:
+
+```
+ℓ
+Yℓ(Rˆr)= (cid:88) D(ℓ) (R)Yℓ (ˆr), (4)
+m mm′ m′
+m′=−ℓ
+```
+
+The summation sign has no Unicode mapping in the font, so it comes out as the raw glyph code `(cid:88)`. The superscripts and subscripts have scattered onto their own lines. The structure is gone, and no model could rebuild the equation from this.
+
+Docling, with formula enrichment, turns the same region into a `<formula>` element whose text is valid LaTeX:
+
+```xml
+<formula>
+  <location value="231"/>
+  <location value="457"/>
+  <location value="480"/>
+  <location value="476"/>
+  Y _ { m } ^ { \ell } ( R \hat { r } ) = \sum _ { m ^ { \prime } = - \ell } ^ { \ell } D _ { m m ^ { \prime } } ^ { ( \ell ) } ( R ) Y _ { m ^ { \prime } } ^ { \ell } ( \hat { r } ) ,
+</formula>
+```
+
+That renders back to the original equation, and it arrives wrapped in a typed element with its bounding box on the page. A fraction of sums tells the same story. The skill returns both summation signs as the glyph code `(cid:80)` and flattens the fraction onto separate lines:
+
+```
+(cid:80)
+I (v)d (u,v)
+ρ (F)= v u G .
+u (cid:80) I (v)
+v u
+```
+
+DocLang keeps it whole:
+
+```xml
+<formula>
+  <location value="242"/>
+  <location value="238"/>
+  <location value="346"/>
+  <location value="254"/>
+  \rho _ { u } ( F ) = \frac { \sum _ { v } I _ { u } ( v ) \, d _ { G } ( u , v ) } { \sum _ { v } I _ { u } ( v ) } .
+</formula>
+```
+
+The enrichment is a vision-language model, not an oracle. Across the seven equations in this paper it recovered the structure (subscripts, superscripts, sums, fractions) every time, but on two of them it misread the proportionality sign ∝ as `\circ`. The layout is trustworthy, individual rare glyphs can still slip. Even so, for a model trying to reason about the paper, the gap between `(cid:88) ... m′=−ℓ` and `\sum_{m'=-ℓ}^{ℓ}` is the gap between a guess and the actual mathematics.
 
 ## Takeaway
 
