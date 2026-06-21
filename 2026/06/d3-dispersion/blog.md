@@ -78,7 +78,7 @@ $$
 The implementation (`_bj_damping`) treats the per-pair ratio
 
 $$
-\frac{C_8^{ij}}{C_6^{ij}} = 3\,\mathrm{r4r2}_i\, \mathrm{r4r2}_j \;\equiv\; \texttt{r4r2\_ij}
+\frac{C_8^{ij}}{C_6^{ij}} = 3\,\mathrm{r4r2}_i\, \mathrm{r4r2}_j \;\equiv\; \mathrm{r4r2}_{ij}
 $$
 
 as a constant. Here $\mathrm{r4r2}_A$ is a **per-element parameter from the D3 reference implementation** (the code simply reads the Fortran `r2r4` array as `r4r2`), used only to build $C_8/C_6 = 3\,\mathrm{r4r2}_i \mathrm{r4r2}_j$. Since $\mathrm{r4r2}_A$ depends only on the element, not on distance or CN, the ratio $C_8/C_6$ factors out as a per-pair constant.
@@ -98,9 +98,9 @@ $$
 Writing the implementation variables `damp_6` and `damp_8` as
 
 $$
-\texttt{damp\_6} = \frac{s_6}{r^6 + R_0^6},\qquad
-\texttt{damp\_8} = \frac{s_8\,(C_8/C_6)}{r^8 + R_0^8},\qquad
-\mathrm{damp}(r) \equiv \texttt{damp\_6} + \texttt{damp\_8}
+\mathrm{damp}_6 = \frac{s_6}{r^6 + R_0^6},\qquad
+\mathrm{damp}_8 = \frac{s_8\,(C_8/C_6)}{r^8 + R_0^8},\qquad
+\mathrm{damp}(r) \equiv \mathrm{damp}_6 + \mathrm{damp}_8
 $$
 
 the unsmoothed single-pair energy becomes
@@ -109,7 +109,7 @@ $$
 E = -\,C_6\,\mathrm{damp}(r)
 $$
 
-since $C_6\cdot\texttt{damp\_8} = s_8 C_8/(r^8+R_0^8)$, which matches the original sum. Note that `damp_6` and `damp_8` are not the bare BJ denominators but the full contributions including the numerator scalings.
+since $C_6\cdot\mathrm{damp}_8 = s_8 C_8/(r^8+R_0^8)$, which matches the original sum. Note that `damp_6` and `damp_8` are not the bare BJ denominators but the full contributions including the numerator scalings.
 
 ### 4. The S5 energy-side switch
 
@@ -178,7 +178,7 @@ which is exactly the fixed code:
 dE_dCN_acc += -damp_sum * dC6_dCNi * sw
 ```
 
-> **Why the $\tfrac12$ appears in the energy but not in `dE/dCN`**: the global energy is $\tfrac12$ times an ordered-pair sum, but the D3 pair quantity is symmetric, so the two ordered pairs $(i,j)$ and $(j,i)$ correspond to the same physical pair. The derivative with respect to $\mathrm{CN}_i$ picks up both, which pairs with the energy's $\tfrac12$ and cancels it. The implementation can therefore keep the one-sided row sum over $j$ directly as $\texttt{dE\_dCN}[i]$.
+> **Why the $\tfrac12$ appears in the energy but not in `dE/dCN`**: the global energy is $\tfrac12$ times an ordered-pair sum, but the D3 pair quantity is symmetric, so the two ordered pairs $(i,j)$ and $(j,i)$ correspond to the same physical pair. The derivative with respect to $\mathrm{CN}_i$ picks up both, which pairs with the energy's $\tfrac12$ and cancels it. The implementation can therefore keep the one-sided row sum over $j$ directly as `dE_dCN[i]`.
 
 **Pass 3**: convert to a force on bond $(i,k)$ through $\mathrm{CN}_i = \sum_k f(r_{ik})$. In `_cn_forces_contrib_kernel_matrix`:
 
