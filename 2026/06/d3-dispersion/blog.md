@@ -17,8 +17,8 @@ With Becke-Johnson (BJ) damping the two-body dispersion energy is
 $$
 E_{\mathrm{disp}} = -\frac{1}{2}\sum_{i}\sum_{j\neq i} s_w(r_{ij})
 \left[
-\frac{s_6\, C_6^{ij}}{r_{ij}^{6} + (R_0^{ij})^{6}}
-+ \frac{s_8\, C_8^{ij}}{r_{ij}^{8} + (R_0^{ij})^{8}}
+\frac{s_6\, C_6^{ij}}{r_{ij}^{6} + (R_0^{ij})^{6}} +
+\frac{s_8\, C_8^{ij}}{r_{ij}^{8} + (R_0^{ij})^{8}}
 \right]
 $$
 
