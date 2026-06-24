@@ -17,8 +17,8 @@ With Becke-Johnson (BJ) damping the two-body dispersion energy is
 $$
 E_{\mathrm{disp}} = -\frac{1}{2}\sum_{i}\sum_{j\neq i} s_w(r_{ij})
 \left[
-\frac{s_6\, C_6^{ij}}{r_{ij}^{6} + (R_0^{ij})^{6}} +
-\frac{s_8\, C_8^{ij}}{r_{ij}^{8} + (R_0^{ij})^{8}}
+\frac{s_6 C_6^{ij}}{r_{ij}^{6} + (R_0^{ij})^{6}} +
+\frac{s_8 C_8^{ij}}{r_{ij}^{8} + (R_0^{ij})^{8}}
 \right]
 $$
 
@@ -32,14 +32,14 @@ The CN is a smooth (non-integer) count of how many atoms sit within bonding dist
 
 $$
 \mathrm{CN}_i = \sum_{k\neq i}
-\frac{1}{1 + \exp\!\big(-k_1\,(\,(R^{\mathrm{cov}}_i + R^{\mathrm{cov}}_k)/r_{ik} - 1)\big)}
+\frac{1}{1 + \exp\!\big(-k_1 ( (R^{\mathrm{cov}}_i + R^{\mathrm{cov}}_k)/r_{ik} - 1)\big)}
 $$
 
 $R^{\mathrm{cov}}$ is the covalent radius and $k_1$ the steepness (default $16$). The distance derivative used later is, in the implementation (`_cn_counting`),
 
 $$
 f \equiv \frac{1}{1+\exp(-k_1(R^{\mathrm{cov}}/r - 1))},\qquad
-\frac{\partial f}{\partial r} = -\,f(1-f)\,k_1\,\frac{R^{\mathrm{cov}}}{r^{2}}
+\frac{\partial f}{\partial r} = - f(1-f) k_1 \frac{R^{\mathrm{cov}}}{r^{2}}
 $$
 
 with $R^{\mathrm{cov}} = R^{\mathrm{cov}}_i + R^{\mathrm{cov}}_k$.
@@ -54,21 +54,21 @@ L_{pq} = \exp\!\Big(k_3\big[(\mathrm{CN}_i - \mathrm{CN}^{\mathrm{ref}}_{i,pq})^
 $$
 
 $$
-C_6^{ij} = \frac{\sum_{pq} C_{6,pq}^{\mathrm{ref}}\, L_{pq}}{\sum_{pq} L_{pq}}
+C_6^{ij} = \frac{\sum_{pq} C_{6,pq}^{\mathrm{ref}} L_{pq}}{\sum_{pq} L_{pq}}
 $$
 
 Because $k_3 < 0$, $L_{pq}$ is a Gaussian centered on the reference point $(\mathrm{CN}^{\mathrm{ref}}_{i},\mathrm{CN}^{\mathrm{ref}}_{j})$ (the code stabilizes this with a log-sum-exp). With $d_i \equiv \mathrm{CN}_i - \mathrm{CN}^{\mathrm{ref}}_{i}$ and the weight sums
 
 $$
 w = \sum_{pq} L_{pq},\quad
-w_{d_i} = \sum_{pq} L_{pq}\, d_i,\quad
-z_{d_i} = \sum_{pq} C_{6,pq}^{\mathrm{ref}}\, L_{pq}\, d_i
+w_{d_i} = \sum_{pq} L_{pq} d_i,\quad
+z_{d_i} = \sum_{pq} C_{6,pq}^{\mathrm{ref}} L_{pq} d_i
 $$
 
 the CN derivative is
 
 $$
-\frac{\partial C_6^{ij}}{\partial \mathrm{CN}_i} = \frac{2 k_3}{w}\big(z_{d_i} - C_6^{ij}\, w_{d_i}\big)
+\frac{\partial C_6^{ij}}{\partial \mathrm{CN}_i} = \frac{2 k_3}{w}\big(z_{d_i} - C_6^{ij} w_{d_i}\big)
 $$
 
 (the `dC6_dCNi` in the code), and similarly for $\mathrm{CN}_j$. This is where $C_6$ acquires a dependence on atomic coordinates through CN, which is what produces the CN-chain force term below.
@@ -78,12 +78,12 @@ $$
 The implementation (`_bj_damping`) treats the per-pair ratio
 
 $$
-\frac{C_8^{ij}}{C_6^{ij}} = 3\,\mathrm{r4r2}_i\, \mathrm{r4r2}_j \;\equiv\; \mathrm{r4r2}_{ij}
+\frac{C_8^{ij}}{C_6^{ij}} = 3 \mathrm{r4r2}_i \mathrm{r4r2}_j \;\equiv\; \mathrm{r4r2}_{ij}
 $$
 
-as a constant. Here $\mathrm{r4r2}_A$ is a **per-element parameter from the D3 reference implementation** (the code simply reads the Fortran `r2r4` array as `r4r2`), used only to build $C_8/C_6 = 3\,\mathrm{r4r2}_i \mathrm{r4r2}_j$. Since $\mathrm{r4r2}_A$ depends only on the element, not on distance or CN, the ratio $C_8/C_6$ factors out as a per-pair constant.
+as a constant. Here $\mathrm{r4r2}_A$ is a **per-element parameter from the D3 reference implementation** (the code simply reads the Fortran `r2r4` array as `r4r2`), used only to build $C_8/C_6 = 3 \mathrm{r4r2}_i \mathrm{r4r2}_j$. Since $\mathrm{r4r2}_A$ depends only on the element, not on distance or CN, the ratio $C_8/C_6$ factors out as a per-pair constant.
 
-> Physically this corresponds to the D3 relation $C_8 = 3\,C_6\sqrt{Q_i Q_j}$, where $Q_A$ is an atomic quantity built from $\langle r^4\rangle/\langle r^2\rangle$ expectation values and the nuclear charge. For the exact definition and normalization, see the original D3 paper or `dftd3.f`. All this post needs is that the quantity is a per-element constant.
+> Physically this corresponds to the D3 relation $C_8 = 3 C_6\sqrt{Q_i Q_j}$, where $Q_A$ is an atomic quantity built from $\langle r^4\rangle/\langle r^2\rangle$ expectation values and the nuclear charge. For the exact definition and normalization, see the original D3 paper or `dftd3.f`. All this post needs is that the quantity is a per-element constant.
 
 The BJ damping radius is
 
@@ -99,14 +99,14 @@ Writing the implementation variables `damp_6` and `damp_8` as
 
 $$
 \mathrm{damp}_6 = \frac{s_6}{r^6 + R_0^6},\qquad
-\mathrm{damp}_8 = \frac{s_8\,(C_8/C_6)}{r^8 + R_0^8},\qquad
+\mathrm{damp}_8 = \frac{s_8 (C_8/C_6)}{r^8 + R_0^8},\qquad
 \mathrm{damp}(r) \equiv \mathrm{damp}_6 + \mathrm{damp}_8
 $$
 
 the unsmoothed single-pair energy becomes
 
 $$
-E = -\,C_6\,\mathrm{damp}(r)
+E = - C_6 \mathrm{damp}(r)
 $$
 
 since $C_6\cdot\mathrm{damp}_8 = s_8 C_8/(r^8+R_0^8)$, which matches the original sum. Note that `damp_6` and `damp_8` are not the bare BJ denominators but the full contributions including the numerator scalings.
@@ -131,12 +131,12 @@ $s_w$ is $1$ at $r_{\mathrm{on}}$ and $0$ at $r_{\mathrm{off}}$, with continuous
 The smoothed single-pair energy is
 
 $$
-E^{\mathrm{sw}} = s_w(r)\, E = -\,s_w(r)\, C_6\, \mathrm{damp}(r)
+E^{\mathrm{sw}} = s_w(r) E = - s_w(r) C_6 \mathrm{damp}(r)
 $$
 
 ## Forces: direct term and CN-chain term
 
-Force is the negative coordinate gradient, $F_i = -\,\partial E_{\mathrm{disp}}/\partial \boldsymbol{x}_i$. The distance dependence of $E^{\mathrm{sw}} = -s_w\,C_6\,\mathrm{damp}$ enters through two routes.
+Force is the negative coordinate gradient, $F_i = - \partial E_{\mathrm{disp}}/\partial \boldsymbol{x}_i$. The distance dependence of $E^{\mathrm{sw}} = -s_w C_6 \mathrm{damp}$ enters through two routes.
 
 > The $\partial E/\partial r$ expressions below are derivatives with respect to the scalar distance. The conversion to a vector force follows the implementation's `r_hat` (unit direction vector) sign convention: the code distributes the result per atom and per component as `F = (dE/dr) * r_hat`, with the sign from projecting onto $\boldsymbol{x}_i$ absorbed into the choice of `r_hat` direction.
 
@@ -149,8 +149,8 @@ The derivative with respect to the pair's own distance $r_{ij}$, holding CN fixe
 
 $$
 \left.\frac{\partial E^{\mathrm{sw}}}{\partial r}\right|_{\mathrm{direct}}
-= s_w\,\frac{\partial E}{\partial r} + E\,\frac{d s_w}{dr}
-= -\,C_6\big[\,s_w\,\mathrm{damp}'(r) + s_w'(r)\,\mathrm{damp}(r)\,\big]
+= s_w \frac{\partial E}{\partial r} + E \frac{d s_w}{dr}
+= - C_6\big[ s_w \mathrm{damp}'(r) + s_w'(r) \mathrm{damp}(r) \big]
 $$
 
 (the code's `dE_dr_direct_sw = sw * dE_dr_direct + e_ij * dsw_dr`). At this point $s_w$ is correctly applied.
@@ -162,14 +162,14 @@ CN is a many-body quantity, so it cannot be reduced to a per-pair force. The imp
 **Pass 2**: accumulate the per-atom quantity $\partial E_{\mathrm{disp}}/\partial \mathrm{CN}_i$. Since $E^{\mathrm{sw}} = s_w E$ and $s_w$ does not depend on CN,
 
 $$
-\frac{\partial E^{\mathrm{sw}}}{\partial \mathrm{CN}_i} = s_w\,\frac{\partial E}{\partial \mathrm{CN}_i}
-= -\,s_w(r_{ij})\,\mathrm{damp}(r_{ij})\,\frac{\partial C_6^{ij}}{\partial \mathrm{CN}_i}
+\frac{\partial E^{\mathrm{sw}}}{\partial \mathrm{CN}_i} = s_w \frac{\partial E}{\partial \mathrm{CN}_i}
+= - s_w(r_{ij}) \mathrm{damp}(r_{ij}) \frac{\partial C_6^{ij}}{\partial \mathrm{CN}_i}
 $$
 
 summed over pairs:
 
 $$
-\frac{\partial E_{\mathrm{disp}}}{\partial \mathrm{CN}_i} = \sum_{j\neq i}\Big(-\,s_w(r_{ij})\,\mathrm{damp}(r_{ij})\,\frac{\partial C_6^{ij}}{\partial \mathrm{CN}_i}\Big)
+\frac{\partial E_{\mathrm{disp}}}{\partial \mathrm{CN}_i} = \sum_{j\neq i}\Big(- s_w(r_{ij}) \mathrm{damp}(r_{ij}) \frac{\partial C_6^{ij}}{\partial \mathrm{CN}_i}\Big)
 $$
 
 which is exactly the fixed code:
@@ -192,14 +192,14 @@ dE_dr_chain = (dE_dCN_i + dE_dCN_j) * dCN_dr
 F_chain = dE_dr_chain * r_hat
 ```
 
-The key point: **$s_w$ does not appear in Pass 3**. Since $s_w$ is CN-independent, folding it once into `dE/dCN` in Pass 2 is sufficient (formally $\partial E^{\mathrm{sw}}/\partial \mathrm{CN} = s_w\,\partial E/\partial \mathrm{CN}$). The $\partial C_6/\partial r$ coupling cannot be closed within a single pair: it must be accumulated over all pairs (Pass 2) and then distributed to each bond through $\partial \mathrm{CN}/\partial r$ (Pass 3).
+The key point: **$s_w$ does not appear in Pass 3**. Since $s_w$ is CN-independent, folding it once into `dE/dCN` in Pass 2 is sufficient (formally $\partial E^{\mathrm{sw}}/\partial \mathrm{CN} = s_w \partial E/\partial \mathrm{CN}$). The $\partial C_6/\partial r$ coupling cannot be closed within a single pair: it must be accumulated over all pairs (Pass 2) and then distributed to each bond through $\partial \mathrm{CN}/\partial r$ (Pass 3).
 
 ## The bug
 
 From $E^{\mathrm{sw}} = s_w E$ and the CN-independence of $s_w$, the CN derivative must carry the same $s_w$:
 
 $$
-\frac{\partial E^{\mathrm{sw}}}{\partial \mathrm{CN}_i} = s_w\,\frac{\partial E}{\partial \mathrm{CN}_i}
+\frac{\partial E^{\mathrm{sw}}}{\partial \mathrm{CN}_i} = s_w \frac{\partial E}{\partial \mathrm{CN}_i}
 $$
 
 The original code accumulated `dE/dCN` **without** $s_w$:
