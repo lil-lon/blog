@@ -57,7 +57,7 @@ $$
 C_6^{ij} = \frac{\sum_{pq} C_{6,pq}^{\mathrm{ref}} L_{pq}}{\sum_{pq} L_{pq}}
 $$
 
-Because $k_3 < 0$, $L_{pq}$ is a Gaussian centered on the reference point $(\mathrm{CN}^{\mathrm{ref}}_{i},\mathrm{CN}^{\mathrm{ref}}_{j})$ (the code stabilizes this with a log-sum-exp). With $d_i \equiv \mathrm{CN}_i - \mathrm{CN}^{\mathrm{ref}}_{i}$ and the weight sums
+Because $k_3 < 0$, $L_{pq}$ is a Gaussian centered on the reference point $(\mathrm{CN}^{\mathrm{ref}}_i,\mathrm{CN}^{\mathrm{ref}}_j)$ (the code stabilizes this with a log-sum-exp). With $d_i \equiv \mathrm{CN}_i - \mathrm{CN}^{\mathrm{ref}}_i$ and the weight sums
 
 $$
 w = \sum_{pq} L_{pq},\quad
@@ -180,7 +180,13 @@ dE_dCN_acc += -damp_sum * dC6_dCNi * sw
 
 > **Why the $\tfrac12$ appears in the energy but not in `dE/dCN`**: the global energy is $\tfrac12$ times an ordered-pair sum, but the D3 pair quantity is symmetric, so the two ordered pairs $(i,j)$ and $(j,i)$ correspond to the same physical pair. The derivative with respect to $\mathrm{CN}_i$ picks up both, which pairs with the energy's $\tfrac12$ and cancels it. The implementation can therefore keep the one-sided row sum over $j$ directly as `dE_dCN[i]`.
 
-**Pass 3**: convert to a force on bond $(i,k)$ through $\mathrm{CN}_i = \sum_k f(r_{ik})$. In `_cn_forces_contrib_kernel_matrix`:
+**Pass 3**: convert to a force on bond $(i,k)$ through the dependence
+
+$$
+\mathrm{CN}_i = \sum_k f(r_{ik})
+$$
+
+In `_cn_forces_contrib_kernel_matrix`:
 
 $$
 \left.\frac{\partial E_{\mathrm{disp}}}{\partial r_{ik}}\right|_{\mathrm{CN}}
