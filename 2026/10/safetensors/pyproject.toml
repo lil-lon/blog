@@ -1,0 +1,14 @@
+[project]
+name = "safetensors-blog"
+version = "0.1.0"
+description = "Blog about why safetensors is safe"
+requires-python = ">=3.13"
+
+dependencies = [
+    "numpy",
+    "safetensors>=0.8",
+    "torch==2.13.0",
+]
+
+[tool.uv]
+exclude-newer = "1 week"
